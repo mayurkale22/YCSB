@@ -1,20 +1,21 @@
 /**
  * Copyright (c) 2017 YCSB contributors. All rights reserved.
  *
- * Licensed under the Apache License, Version 2.0 (the "License"); you
- * may not use this file except in compliance with the License. You
- * may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License. You may obtain a copy of the License at
  *
  * http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
- * implied. See the License for the specific language governing
- * permissions and limitations under the License. See accompanying
- * LICENSE file.
+ * Unless required by applicable law or agreed to in writing, software distributed under the License
+ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+ * or implied. See the License for the specific language governing permissions and limitations under
+ * the License. See accompanying LICENSE file.
  */
 package site.ycsb.db.cloudspanner;
+
+import static site.ycsb.db.cloudspanner.MetricsConstants.GRPC_CLIENT_METHOD_KEY;
+import static site.ycsb.db.cloudspanner.MetricsConstants.SPANNER_GFE_LATENCY;
+import static site.ycsb.db.cloudspanner.MetricsConstants.SPANNER_GFE_LATENCY_VIEW;
 
 import com.google.common.base.Joiner;
 import com.google.cloud.spanner.DatabaseId;
@@ -32,6 +33,27 @@ import com.google.cloud.spanner.Statement;
 import com.google.cloud.spanner.Struct;
 import com.google.cloud.spanner.StructReader;
 import com.google.cloud.spanner.TimestampBound;
+import io.grpc.CallOptions;
+import io.grpc.Channel;
+import io.grpc.ClientCall;
+import io.grpc.ClientInterceptor;
+import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;
+import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
+import io.grpc.Metadata;
+import io.grpc.MethodDescriptor;
+// import io.opencensus.common.Duration;
+import io.opencensus.common.Scope;
+import io.opencensus.stats.Stats;
+import io.opencensus.stats.StatsRecorder;
+import io.opencensus.stats.ViewManager;
+import io.opencensus.tags.TagContext;
+import io.opencensus.tags.TagValue;
+import io.opencensus.tags.Tagger;
+import io.opencensus.tags.Tags;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import site.ycsb.ByteIterator;
 import site.ycsb.Client;
 import site.ycsb.DB;
@@ -39,6 +61,11 @@ import site.ycsb.DBException;
 import site.ycsb.Status;
 import site.ycsb.StringByteIterator;
 import site.ycsb.workloads.CoreWorkload;
+// import io.opencensus.exporter.stats.stackdriver.StackdriverStatsConfiguration;
+// import io.opencensus.exporter.stats.stackdriver.StackdriverStatsExporter;
+import io.opencensus.contrib.grpc.metrics.RpcViews;
+import io.prometheus.client.exporter.HTTPServer;
+import io.opencensus.exporter.stats.prometheus.PrometheusStatsCollector;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -60,10 +87,13 @@ public class CloudSpannerClient extends DB {
    * The names of properties which can be specified in the config files and flags.
    */
   public static final class CloudSpannerProperties {
-    private CloudSpannerProperties() {}
+
+    private CloudSpannerProperties() {
+    }
 
     /**
-     * The Cloud Spanner database name to use when running the YCSB benchmark, e.g. 'ycsb-database'.
+     * The Cloud Spanner database name to use when running the YCSB benchmark, e.g.
+     * 'ycsb-database'.
      */
     static final String DATABASE = "cloudspanner.database";
     /**
@@ -75,21 +105,21 @@ public class CloudSpannerClient extends DB {
      */
     static final String READ_MODE = "cloudspanner.readmode";
     /**
-     * The number of inserts to batch during the bulk loading phase. The default value is 1, which means no batching
-     * is done. Recommended value during data load is 1000.
+     * The number of inserts to batch during the bulk loading phase. The default value is 1, which
+     * means no batching is done. Recommended value during data load is 1000.
      */
     static final String BATCH_INSERTS = "cloudspanner.batchinserts";
     /**
-     * Number of seconds we allow reads to be stale for. Set to 0 for strong reads (default).
-     * For performance gains, this should be set to 10 seconds.
+     * Number of seconds we allow reads to be stale for. Set to 0 for strong reads (default). For
+     * performance gains, this should be set to 10 seconds.
      */
     static final String BOUNDED_STALENESS = "cloudspanner.boundedstaleness";
 
     // The properties below usually do not need to be set explicitly.
 
     /**
-     * The Cloud Spanner project ID to use when running the YCSB benchmark, e.g. 'myproject'. This is not strictly
-     * necessary and can often be inferred from the environment.
+     * The Cloud Spanner project ID to use when running the YCSB benchmark, e.g. 'myproject'. This
+     * is not strictly necessary and can often be inferred from the environment.
      */
     static final String PROJECT = "cloudspanner.project";
     /**
@@ -97,9 +127,49 @@ public class CloudSpannerClient extends DB {
      */
     static final String HOST = "cloudspanner.host";
     /**
-     * Number of Cloud Spanner client channels to use. It's recommended to leave this to be the default value.
+     * Number of Cloud Spanner client channels to use. It's recommended to leave this to be the
+     * default value.
      */
     static final String NUM_CHANNELS = "cloudspanner.channels";
+  }
+
+  private static class HeaderClientInterceptor implements ClientInterceptor {
+
+    @Override
+    public <ReqT, RespT> ClientCall<ReqT, RespT> interceptCall(MethodDescriptor<ReqT, RespT> method,
+        CallOptions callOptions, Channel next) {
+      return new SimpleForwardingClientCall<ReqT, RespT>(next.newCall(method, callOptions)) {
+
+        @Override
+        public void start(Listener<RespT> responseListener, Metadata headers) {
+          super.start(new SimpleForwardingClientCallListener<RespT>(responseListener) {
+            @Override
+            public void onHeaders(Metadata metadata) {
+              processHeader(metadata, method.getFullMethodName());
+              super.onHeaders(metadata);
+            }
+          }, headers);
+        }
+      };
+    }
+
+    private static void processHeader(Metadata metadata, String method) {
+      if (metadata.get(SERVER_TIMING_HEADER_KEY) != null) {
+        String serverTiming = metadata.get(SERVER_TIMING_HEADER_KEY);
+        Matcher matcher = SERVER_TIMING_HEADER_PATTERN.matcher(serverTiming);
+        if (matcher.find()) {
+          long latency = Long.parseLong(matcher.group("dur"));
+
+          TagContext tctx = TAGGER.emptyBuilder()
+              .put(GRPC_CLIENT_METHOD_KEY, TagValue.create(method)).build();
+          try (Scope ss = TAGGER.withTagContext(tctx)) {
+            STATS_RECORDER.newMeasureMap()
+                .put(SPANNER_GFE_LATENCY, latency)
+                .record();
+          }
+        }
+      }
+    }
   }
 
   private static int fieldCount;
@@ -133,14 +203,26 @@ public class CloudSpannerClient extends DB {
   // Note that we have a separate CloudSpannerClient object per thread.
   private final ArrayList<Mutation> bufferedMutations = new ArrayList<>();
 
+  private static final ViewManager VIEW_MANAGER = Stats.getViewManager();
+  private static final StatsRecorder STATS_RECORDER = Stats.getStatsRecorder();
+  private static final Tagger TAGGER = Tags.getTagger();
+
+  private static final Metadata.Key<String> SERVER_TIMING_HEADER_KEY =
+      Metadata.Key.of("server-timing", Metadata.ASCII_STRING_MARSHALLER);
+  private static final Pattern SERVER_TIMING_HEADER_PATTERN = Pattern.compile(".*dur=(?<dur>\\d+)");
+  private static final HeaderClientInterceptor HEADER_CLIENT_INTERCEPTOR = new HeaderClientInterceptor();
+
+
   private static void constructStandardQueriesAndFields(Properties properties) {
-    String table = properties.getProperty(CoreWorkload.TABLENAME_PROPERTY, CoreWorkload.TABLENAME_PROPERTY_DEFAULT);
+    String table = properties
+        .getProperty(CoreWorkload.TABLENAME_PROPERTY, CoreWorkload.TABLENAME_PROPERTY_DEFAULT);
     final String fieldprefix = properties.getProperty(CoreWorkload.FIELD_NAME_PREFIX,
-                                                      CoreWorkload.FIELD_NAME_PREFIX_DEFAULT);
+        CoreWorkload.FIELD_NAME_PREFIX_DEFAULT);
     standardQuery = new StringBuilder()
         .append("SELECT * FROM ").append(table).append(" WHERE id=@key").toString();
     standardScan = new StringBuilder()
-        .append("SELECT * FROM ").append(table).append(" WHERE id>=@startKey LIMIT @count").toString();
+        .append("SELECT * FROM ").append(table).append(" WHERE id>=@startKey LIMIT @count")
+        .toString();
     for (int i = 0; i < fieldCount; i++) {
       STANDARD_FIELDS.add(fieldprefix + i);
     }
@@ -157,7 +239,8 @@ public class CloudSpannerClient extends DB {
             .setMinSessions(numThreads)
             // Since we have no read-write transactions, we can set the write session fraction to 0.
             .setWriteSessionsFraction(0)
-            .build());
+            .build())
+        .setInterceptorProvider(() -> Collections.singletonList(HEADER_CLIENT_INTERCEPTOR));
     if (host != null) {
       optionsBuilder.setHost(host);
     }
@@ -169,11 +252,11 @@ public class CloudSpannerClient extends DB {
     }
     spanner = optionsBuilder.build().getService();
     Runtime.getRuntime().addShutdownHook(new Thread("spannerShutdown") {
-        @Override
-        public void run() {
-          spanner.close();
-        }
-      });
+      @Override
+      public void run() {
+        spanner.close();
+      }
+    });
     return spanner;
   }
 
@@ -183,22 +266,43 @@ public class CloudSpannerClient extends DB {
       if (dbClient != null) {
         return;
       }
+
       Properties properties = getProperties();
       String host = properties.getProperty(CloudSpannerProperties.HOST);
       String project = properties.getProperty(CloudSpannerProperties.PROJECT);
       String instance = properties.getProperty(CloudSpannerProperties.INSTANCE, "ycsb-instance");
       String database = properties.getProperty(CloudSpannerProperties.DATABASE, "ycsb-database");
 
+      VIEW_MANAGER.registerView(SPANNER_GFE_LATENCY_VIEW);
+      RpcViews.registerClientGrpcBasicViews();
+
+      try {
+        PrometheusStatsCollector.createAndRegister();
+        HTTPServer server = new HTTPServer("localhost", 8888, true);
+
+        // StackdriverStatsExporter.createAndRegister(
+        //     StackdriverStatsConfiguration.builder()
+        //         .setProjectId("span-cloud-testing")
+        //         .setExportInterval(Duration.create(60, 0))
+        //         .build());
+      } catch (IOException e) {
+        System.out.println(e.getMessage());
+        LOGGER.log(Level.SEVERE, "StackdriverStatsExporter", e);
+      }
+
       fieldCount = Integer.parseInt(properties.getProperty(
           CoreWorkload.FIELD_COUNT_PROPERTY, CoreWorkload.FIELD_COUNT_PROPERTY_DEFAULT));
-      queriesForReads = properties.getProperty(CloudSpannerProperties.READ_MODE, "query").equals("query");
-      batchInserts = Integer.parseInt(properties.getProperty(CloudSpannerProperties.BATCH_INSERTS, "1"));
+      queriesForReads = properties.getProperty(CloudSpannerProperties.READ_MODE, "query")
+          .equals("query");
+      batchInserts = Integer
+          .parseInt(properties.getProperty(CloudSpannerProperties.BATCH_INSERTS, "1"));
       constructStandardQueriesAndFields(properties);
 
       int boundedStalenessSeconds = Integer.parseInt(properties.getProperty(
           CloudSpannerProperties.BOUNDED_STALENESS, "0"));
       timestampBound = (boundedStalenessSeconds <= 0) ?
-          TimestampBound.strong() : TimestampBound.ofMaxStaleness(boundedStalenessSeconds, TimeUnit.SECONDS);
+          TimestampBound.strong()
+          : TimestampBound.ofMaxStaleness(boundedStalenessSeconds, TimeUnit.SECONDS);
 
       try {
         spanner = getSpanner(properties, host, project);
@@ -276,7 +380,8 @@ public class CloudSpannerClient extends DB {
     Iterable<String> columns = fields == null ? STANDARD_FIELDS : fields;
     Statement query;
     if (fields == null || fields.size() == fieldCount) {
-      query = Statement.newBuilder(standardScan).bind("startKey").to(startKey).bind("count").to(recordCount).build();
+      query = Statement.newBuilder(standardScan).bind("startKey").to(startKey).bind("count")
+          .to(recordCount).build();
     } else {
       Joiner joiner = Joiner.on(',');
       query = Statement.newBuilder("SELECT ")
@@ -312,7 +417,7 @@ public class CloudSpannerClient extends DB {
     KeySet keySet =
         KeySet.newBuilder().addRange(KeyRange.closedClosed(Key.of(startKey), Key.of())).build();
     try (ResultSet resultSet = dbClient.singleUse(timestampBound)
-                                       .read(table, keySet, columns, Options.limit(recordCount))) {
+        .read(table, keySet, columns, Options.limit(recordCount))) {
       while (resultSet.next()) {
         HashMap<String, ByteIterator> row = new HashMap<>();
         decodeStruct(columns, resultSet, row);
@@ -351,8 +456,9 @@ public class CloudSpannerClient extends DB {
       }
       bufferedMutations.add(m.build());
     } else {
-      LOGGER.log(Level.INFO, "Limit of cached mutations reached. The given mutation with key " + key +
-          " is ignored. Is this a retry?");
+      LOGGER
+          .log(Level.INFO, "Limit of cached mutations reached. The given mutation with key " + key +
+              " is ignored. Is this a retry?");
     }
     if (bufferedMutations.size() < batchInserts) {
       return Status.BATCHED_OK;
