@@ -41,7 +41,7 @@ import io.grpc.ForwardingClientCall.SimpleForwardingClientCall;
 import io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener;
 import io.grpc.Metadata;
 import io.grpc.MethodDescriptor;
-// import io.opencensus.common.Duration;
+import io.opencensus.common.Duration;
 import io.opencensus.common.Scope;
 import io.opencensus.stats.Stats;
 import io.opencensus.stats.StatsRecorder;
@@ -61,12 +61,11 @@ import site.ycsb.DBException;
 import site.ycsb.Status;
 import site.ycsb.StringByteIterator;
 import site.ycsb.workloads.CoreWorkload;
-// import io.opencensus.exporter.stats.stackdriver.StackdriverStatsConfiguration;
-// import io.opencensus.exporter.stats.stackdriver.StackdriverStatsExporter;
+import io.opencensus.exporter.stats.stackdriver.StackdriverStatsConfiguration;
+import io.opencensus.exporter.stats.stackdriver.StackdriverStatsExporter;
 import io.opencensus.contrib.grpc.metrics.RpcViews;
-import io.prometheus.client.exporter.HTTPServer;
-import io.opencensus.exporter.stats.prometheus.PrometheusStatsCollector;
-
+// import io.prometheus.client.exporter.HTTPServer;
+// import io.opencensus.exporter.stats.prometheus.PrometheusStatsCollector;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -277,14 +276,13 @@ public class CloudSpannerClient extends DB {
       RpcViews.registerClientGrpcBasicViews();
 
       try {
-        PrometheusStatsCollector.createAndRegister();
-        HTTPServer server = new HTTPServer("localhost", 8888, true);
-
-        // StackdriverStatsExporter.createAndRegister(
-        //     StackdriverStatsConfiguration.builder()
-        //         .setProjectId("span-cloud-testing")
-        //         .setExportInterval(Duration.create(60, 0))
-        //         .build());
+        // PrometheusStatsCollector.createAndRegister();
+        // HTTPServer server = new HTTPServer("localhost", 8888, true);
+        StackdriverStatsExporter.createAndRegister(
+            StackdriverStatsConfiguration.builder()
+                .setProjectId("span-cloud-testing")
+                .setExportInterval(Duration.create(60, 0))
+                .build());
       } catch (IOException e) {
         System.out.println(e.getMessage());
         LOGGER.log(Level.SEVERE, "StackdriverStatsExporter", e);
