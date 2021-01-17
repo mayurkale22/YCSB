@@ -82,18 +82,6 @@ LICENSE file.
 
     <dependency>
       <groupId>io.opencensus</groupId>
-      <artifactId>opencensus-exporter-stats-prometheus</artifactId>
-      <version>${opencensus.version}</version>
-    </dependency>
-
-    <dependency>
-      <groupId>io.prometheus</groupId>
-      <artifactId>simpleclient_httpserver</artifactId>
-      <version>0.3.0</version>
-    </dependency>
-
-    <dependency>
-      <groupId>io.opencensus</groupId>
       <artifactId>opencensus-impl</artifactId>
       <version>${opencensus.version}</version>
     </dependency>
